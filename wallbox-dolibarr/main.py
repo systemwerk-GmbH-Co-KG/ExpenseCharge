@@ -555,20 +555,33 @@ async def sensor_callback(entity_id: str, state: Dict[str, Any]):
 async def check_startup_session():
     """Prüft beim Start ob eine aktive Session existiert UND ob die Wallbox
     aktuell lädt — fängt verlorene Sessions ab wenn das Addon während einer
-    laufenden Ladung neugestartet wurde."""
+    laufenden Ladung neugestartet wurde.
+
+    WICHTIG (Datenverlust-Fix): Der Energiezähler ist kumulativ und läuft
+    während eines Addon-/HA-Neustarts unbeeinflusst weiter. Eine beim Start
+    vorgefundene 'active' Session darf deshalb NICHT pauschal als
+    unvollständig verworfen werden — sonst gehen alle bis dahin geladenen
+    kWh verloren, obwohl der Zähler sie korrekt mitgezählt hat. Stattdessen:
+      - Zustand JETZT zeigt eindeutig "beendet" (Auto während des Ausfalls
+        abgesteckt) → Session SOFORT mit dem frisch gelesenen Zählerstand
+        korrekt abschließen. Das muss hier passieren, weil Home Assistant nur
+        auf Zustands-WECHSEL Events schickt — ein bereits erreichter Endzustand
+        löst nie mehr ein "state_changed"-Event aus, das ihn beenden könnte.
+      - Zustand zeigt noch "lädt"/"pausiert" → Session unangetastet lassen,
+        sie läuft in der DB als 'active' weiter und wird ganz normal per
+        Zustands-Event/Idle-Wache beendet, sobald es soweit ist.
+      - Zustand nicht bestimmbar (z.B. power_threshold/energy_delta ohne
+        Zeitdauer-Info) → ebenfalls offen lassen; die Session-Wache
+        (max_session_hours) greift notfalls später mit einem dann aktuellen
+        Zählerstand.
+    """
     global session_manager, api_client, _pending_auth, _latest_energy, _latest_rfid
-
-    # 1) Alte 'active' Sessions in SQLite als unvollständig markieren
-    recovered_sessions = session_manager.recover_active_sessions()
-    if recovered_sessions:
-        _LOGGER.info("=== Startup Recovery: %d aktive Sessions gefunden ===", len(recovered_sessions))
-        for session in recovered_sessions:
-            session_manager.mark_session_incomplete(session['id'], 'restart_recovery')
-            _LOGGER.warning("Session %d als unvollständig markiert (Addon-Neustart)", session['id'])
-
-    # 2) EINMALIGER Snapshot ALLER States (vor dem subscribe-Loop, konkurrenzfrei).
-    #    Seedet den Energie-Cache und prüft ob gerade geladen wird.
     global _last_power_high_time, _last_energy_change_time
+
+    # 1) EINMALIGER Snapshot ALLER States (vor dem subscribe-Loop, konkurrenzfrei) —
+    #    VOR jeder Entscheidung über eine vorgefundene aktive Session. Nur mit
+    #    einem frischen Zählerstand lässt sich eine während des Ausfalls beendete
+    #    Ladung noch vollständig und korrekt abrechnen.
     sensor_rfid   = profile.sensor_rfid
     sensor_state  = profile.sensor_state
     sensor_energy = profile.sensor_energy
@@ -576,13 +589,12 @@ async def check_startup_session():
         snapshot = await ha_ws.get_all_states()
     except Exception as exc:
         _LOGGER.warning("Konnte Wallbox-Zustand beim Start nicht lesen: %s", exc)
-        return
+        snapshot = {}
 
     rfid_val   = (snapshot.get(sensor_rfid)  or {}).get('state', '') or '' if sensor_rfid else ''
     state_val  = (snapshot.get(sensor_state) or {}).get('state', '') or ''
     energy_raw = (snapshot.get(sensor_energy) or {}).get('state')
 
-    # Anliegenden Tag cachen — Fallback für Charging-Start ohne frisches Event
     if rfid_val and rfid_val.lower() not in _RFID_NONE_VALUES:
         _latest_rfid = rfid_val
 
@@ -597,31 +609,77 @@ async def check_startup_session():
     _LOGGER.info("Wallbox-Zustand beim Start: state='%s', rfid='%s', zaehler=%s kWh",
                  state_val, rfid_val, ('%.3f' % seeded) if seeded is not None else 'n/a')
 
-    # Bereits laufende Ladung je nach state_mode erkennen. Tag-Quelle beim
-    # nachträglichen Start: anliegender Tag (gerade oben gecacht), sonst
-    # PERSISTIERTE Autorisierung (überlebt Neustart) — via _try_start_from_signal.
-    already_charging = False
-    if profile.state_mode == 'state_keywords':
-        already_charging = wallbox_profile.classify_state(
-            state_val, profile.end_keywords, profile.pause_keywords) == 'charging'
-    elif profile.state_mode == 'power_threshold' and profile.power_sensor:
-        power_val = _parse_energy((snapshot.get(profile.power_sensor) or {}).get('state'))
-        if power_val is not None and power_val >= profile.power_threshold_w:
-            already_charging = True
-            _last_power_high_time = time.time()
-    elif profile.state_mode == 'external_boolean' and profile.active_entity:
-        active_val = str((snapshot.get(profile.active_entity) or {}).get('state', '')).strip().lower()
-        already_charging = active_val in ('on', 'true', '1')
-    # state_mode='energy_delta': ein Einzel-Snapshot kann keine Bewegung des
-    # Zählers zeigen — Erkennung übernimmt der erste energy_sensor-Event danach.
+    # 2) Vorgefundene aktive Session(en) anhand des JETZT gelesenen Zustands
+    #    behandeln — siehe Docstring oben.
+    recovered_sessions = session_manager.recover_active_sessions()
+    if recovered_sessions:
+        newest, *stale_extra = recovered_sessions
+        _LOGGER.info("=== Startup Recovery: Session #%s war beim Neustart aktiv ===", newest['id'])
 
-    if already_charging:
-        _LOGGER.warning(
-            "Wallbox lädt bereits beim Addon-Start (state_mode=%s) — versuche "
-            "Session nachträglich zu starten. Bereits geladene kWh vor diesem "
-            "Start sind für DIESE Session verloren, ab jetzt wird erfasst.",
-            profile.state_mode)
-        await _try_start_from_signal('startup_charging_detected')
+        definitely_ended = False
+        if profile.state_mode == 'state_keywords':
+            definitely_ended = wallbox_profile.classify_state(
+                state_val, profile.end_keywords, profile.pause_keywords) == 'end'
+        elif profile.state_mode == 'external_boolean' and profile.active_entity:
+            active_val = str((snapshot.get(profile.active_entity) or {}).get('state', '')).strip().lower()
+            definitely_ended = active_val in ('off', 'false', '0')
+        # power_threshold/energy_delta: ein Einzel-Snapshot kann ein Ende nicht
+        # zuverlässig belegen (fehlende Zeitdauer-Info) — Session bleibt offen,
+        # idle_energy_guard erkennt das Ende danach ganz normal weiter unten.
+
+        if definitely_ended and seeded is not None:
+            _LOGGER.warning(
+                "Session #%s wurde WÄHREND des Neustarts beendet (state='%s') — "
+                "schließe sie jetzt mit dem aktuellen Zählerstand (%.3f kWh) ab, "
+                "damit die geladene Energie nicht verloren geht.",
+                newest['id'], state_val, seeded)
+            await _end_active_session('restart_recovery_ended')
+        elif definitely_ended:
+            _LOGGER.warning(
+                "Session #%s während des Ausfalls beendet, aber kein Zählerstand "
+                "verfügbar — kWh nicht berechenbar, wird als unvollständig markiert.",
+                newest['id'])
+            session_manager.mark_session_incomplete(newest['id'], 'restart_recovery_no_energy')
+        else:
+            _LOGGER.info(
+                "Session #%s bleibt nach dem Neustart aktiv (Ladung läuft/pausiert "
+                "vermutlich weiter) — wird ganz normal per Zustands-Event/Idle-Wache "
+                "beendet, sobald es soweit ist. Keine Energie geht dabei verloren.",
+                newest['id'])
+
+        # Mehr als eine 'active' Session ist eine Dateninkonsistenz (sollte durch
+        # den Doppelstart-Schutz nie vorkommen) — ältere defensiv abschließen.
+        for stale in stale_extra:
+            session_manager.mark_session_incomplete(stale['id'], 'restart_recovery_duplicate')
+            _LOGGER.error("Zusätzliche aktive Session #%s (Dateninkonsistenz) als "
+                          "unvollständig markiert.", stale['id'])
+
+    # 3) Nur falls jetzt WIRKLICH keine Session mehr aktiv ist (auch nach obiger
+    #    Recovery), prüfen ob die Wallbox schon lädt und ggf. eine neue starten
+    #    (z.B. Erstinstallation während einer laufenden Ladung).
+    if session_manager.get_active_session() is None:
+        already_charging = False
+        if profile.state_mode == 'state_keywords':
+            already_charging = wallbox_profile.classify_state(
+                state_val, profile.end_keywords, profile.pause_keywords) == 'charging'
+        elif profile.state_mode == 'power_threshold' and profile.power_sensor:
+            power_val = _parse_energy((snapshot.get(profile.power_sensor) or {}).get('state'))
+            if power_val is not None and power_val >= profile.power_threshold_w:
+                already_charging = True
+                _last_power_high_time = time.time()
+        elif profile.state_mode == 'external_boolean' and profile.active_entity:
+            active_val = str((snapshot.get(profile.active_entity) or {}).get('state', '')).strip().lower()
+            already_charging = active_val in ('on', 'true', '1')
+        # state_mode='energy_delta': ein Einzel-Snapshot kann keine Bewegung des
+        # Zählers zeigen — Erkennung übernimmt der erste energy_sensor-Event danach.
+
+        if already_charging:
+            _LOGGER.warning(
+                "Wallbox lädt bereits beim Addon-Start (state_mode=%s) — versuche "
+                "Session nachträglich zu starten. Bereits geladene kWh vor diesem "
+                "Start sind für DIESE Session verloren, ab jetzt wird erfasst.",
+                profile.state_mode)
+            await _try_start_from_signal('startup_charging_detected')
 
     # Falls gerade ein Tag anliegt, ihn als pending-auth merken (für Charging-Wechsel)
     if rfid_val and rfid_val.lower() not in _RFID_NONE_VALUES:
