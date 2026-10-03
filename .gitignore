@@ -27,6 +27,7 @@ __pycache__/
 Thumbs.db
 
 # Secrets — NIE committen
+.secret/
 github_token.txt
 github_token_*.txt
 *.token
@@ -39,6 +40,12 @@ module_bsp-1.0.zip
 
 # HA Addon
 /data/
+# Laufzeitdaten des Containers: options.json mit Wallbox-Passwort und
+# Dolibarr-Token, sessions.db. Die Repos sind oeffentlich — NIE committen.
+# ('/data/' oben greift nur im Repo-Wurzelverzeichnis.)
+wallbox-dolibarr/data/
+# Lokale Anpassungen am Server — sollen nie git pull blockieren
+docker-compose.override.yml
 *.db
 *.db-wal
 *.db-shm

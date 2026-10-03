@@ -23,6 +23,40 @@ configuration:
     description: >-
       Liste erlaubter RFID-Tag-IDs (Hex-Strings, z.B. "A1B2C3D4"). Alle
       anderen Tags werden ignoriert. Bei auth_mode "none" wirkungslos.
+      Im OCPP-Betrieb ohne Groß-/Kleinschreibung verglichen; Karten in
+      Dolibarr in GROSSBUCHSTABEN eintragen.
+
+  session_source:
+    name: "Datenquelle / Betriebsart"
+    description: >-
+      "ha_sensors": Ladevorgänge werden aus Home-Assistant-Sensoren abgeleitet
+      (wallbox_profile, sensor_*). "ocpp": ExpenseCharge ist selbst der
+      OCPP-Server — die Wallbox verbindet sich direkt, unbekannte Karten werden
+      abgelehnt. Dann zusätzlich ocpp_charge_points ausfüllen und unter
+      "Netzwerk" den Port 9000/tcp freigeben.
+
+  ocpp_charge_points:
+    name: "OCPP-Wallboxen"
+    description: >-
+      Nur bei session_source "ocpp". Je Wallbox: id = Charge-Point-ID (letzter
+      Teil der Verbindungs-URL; eine unbekannte ID steht nach dem ersten
+      Verbindungsversuch im Log), optional password (Basic Auth, mind. 16
+      Zeichen; leer = ohne Passwort, nur im vertrauenswürdigen LAN) und
+      optional wallbox_id (Name in Dolibarr, Standard = id).
+
+  ocpp_heartbeat_interval:
+    name: "OCPP-Heartbeat (Sekunden)"
+    description: >-
+      Intervall, das der Wallbox beim Anmelden mitgeteilt wird (30–3600).
+
+  ocpp_apply_recommended_config:
+    name: "Empfohlene Wallbox-Einstellungen setzen"
+    description: >-
+      Wenn aktiv, setzt ExpenseCharge nach jedem Wallbox-Start
+      MeterValueSampleInterval=60,
+      MeterValuesSampledData=Energy.Active.Import.Register und
+      StopTransactionOnInvalidId=true. Standard aus — ohne Zustimmung wird
+      nichts an der Wallbox verändert.
 
   wallbox_profile:
     name: "Wallbox-Profil"
@@ -139,6 +173,15 @@ configuration:
       verwendet. Nur nötig als Fallback, falls das Addon nicht über den
       Supervisor authentifizieren kann.
 
+  rfid_hold_seconds:
+    name: "RFID-Haltezeit (Sekunden)"
+    description: >-
+      0 = aus (Standard). Manche Quellen halten den zuletzt gelesenen Tag
+      dauerhaft — die Alfen-Integration leitet ihn aus dem Transaktions-Log
+      ab, also aus dem letzten abgeschlossenen Ladevorgang. Dann bleibt der
+      Wert stehen und bringt die Zustandserkennung durcheinander. Mit einem
+      Wert größer 0 setzt ExpenseCharge den Tag nach dieser Zeit selbst auf
+      "kein Tag" zurück. 1.0 ist ein guter Startwert.
   min_session_kwh:
     name: "Mindest-kWh pro Session"
     description: >-
@@ -154,8 +197,133 @@ configuration:
       beendet. Großzügig wählen, damit normale Lastmanagement-Pausen
       nicht betroffen sind (Default 24h).
 
+  web_port:
+    name: "Port der Web-UI"
+    description: >-
+      Port, auf dem die Weboberfläche lauscht (im Container). Im Addon-Betrieb
+      gleich dem Ingress-Port 8099 lassen.
+
+  web_bind:
+    name: "Bind-Adresse der Web-UI"
+    description: >-
+      An welche Adresse die Weboberfläche gebunden wird. Im Addon-Betrieb
+      0.0.0.0, der Ingress greift von außen zu. Standalone ohne Reverse-Proxy
+      besser 127.0.0.1 — dort gibt es keinen HA-Login als Schutz.
+
+  ocpp_port:
+    name: "Port des OCPP-Servers"
+    description: >-
+      Container-Port, auf dem der OCPP-Server lauscht. Der von außen erreichbare
+      Port wird in HA unter Netzwerk zugeordnet.
+
+  ocpp_bind:
+    name: "Bind-Adresse des OCPP-Servers"
+    description: >-
+      An welche Adresse der OCPP-Server gebunden wird. 0.0.0.0 lassen, damit die
+      Wallbox ihn erreicht.
+
+  debounce_seconds:
+    name: "RFID-Entprellung (Sekunden)"
+    description: >-
+      Sperrzeit nach einem gelesenen Tag, damit eine Doppellesung nicht zwei
+      Vorgänge auslöst. Höher setzen, wenn der Leser denselben Tag mehrfach
+      meldet.
+
+  max_plausible_kw:
+    name: "Plausibilitätsgrenze Leistung (kW)"
+    description: >-
+      Liegt die mittlere Leistung einer Ladung darüber, gilt sie als Zähler-
+      oder Einheitenfehler und wird NICHT abgerechnet, sondern als unvollständig
+      markiert. 50 passt für AC-Wallboxen mit maximal 22 kW. Fuer eine
+      DC-Ladesäule anheben, sonst landet jede schnelle Ladung in der manuellen
+      Prüfung.
+
+  max_discard_hours:
+    name: "Kurz-Session-Fenster (Stunden)"
+    description: >-
+      Bleibt eine Ladung unter min_session_kwh, gilt sie bis zu dieser Dauer als
+      Karte gehalten, nie geladen und wird verworfen. Dauert sie länger, ist es
+      ein Zählerfehler und sie wird als unvollständig sichtbar — typisch bei
+      einer Wallbox, die kWh statt Wh meldet.
+
+  pending_auth_window:
+    name: "Gültigkeit vorgehaltener Karte (Sekunden)"
+    description: >-
+      So lange bleibt ein vorgehaltener Tag für einen späteren Ladebeginn
+      gültig. Wichtig bei Lastmanagement, das den Start um Stunden verschieben
+      kann.
+
+  api_timeout:
+    name: "Dolibarr-Zeitlimit (Sekunden)"
+    description: >-
+      Zeitlimit je Anfrage an Dolibarr. Bei langsamer Verbindung erhöhen.
+
+  api_retries:
+    name: "Dolibarr-Wiederholungen"
+    description: >-
+      Wiederholungen bei Überlast oder Serverfehler (429/5xx). 0 schaltet sie
+      ab. Nicht übertragene Ladungen bleiben ohnehin im lokalen Puffer und
+      werden später erneut versucht.
+
+  api_backoff:
+    name: "Dolibarr-Wartefaktor"
+    description: >-
+      Wartezeit zwischen den Wiederholungen, wachsend. Vorsicht: hohe Werte mal
+      viele Wiederholungen summieren sich zu Minuten.
+
+  learn_ttl_seconds:
+    name: "Lernmodus: Klartext-Haltezeit (Sekunden)"
+    description: >-
+      So lange bleibt die Klartext-ID einer erkannten Karte im Arbeitsspeicher
+      sichtbar, damit du sie benennen kannst. Danach verschwindet sie.
+      Gespeichert wird nie der Klartext, nur der Hash.
+
+  learn_max_entries:
+    name: "Lernmodus: max. Karten in der Liste"
+    description: >-
+      Wie viele erkannte Karten der Lernmodus gleichzeitig vorhält.
+
+  trend_days:
+    name: "Tagesstreifen: Fenster (Tage)"
+    description: >-
+      Wie viele Tage der Streifen auf der Startseite zeigt.
+
+  alfen:
+    name: "Alfen HTTPS-API"
+    description: >-
+      Nur bei session_source "alfen_http". host ist IP, Hostname oder
+      vollständige URL der Wallbox; ohne Schema wird https angenommen. username
+      und password sind die Zugangsdaten der Wallbox selbst, nicht die von
+      Dolibarr. verify_ssl bleibt aus, weil Alfen ein selbst ausgestelltes
+      Zertifikat liefert. poll_interval ist der Takt fuer Zähler und Zustand
+      (Anzeige), transaction_interval der Takt fuer das Transaktions-Log
+      (Abrechnung) — das Log zu lesen ist teuer, darum seltener. param_energy
+      und param_state sind die Alfen-Parameter-IDs, Standard 2221_22 und 2501_1
+      fuer Steckdose 1. fixed_login ordnet alle Ladungen einem Dolibarr-Benutzer
+      zu, falls keine Karte vorliegt. Eine unvollständige Konfiguration lässt
+      das Addon absichtlich nicht starten.
+
+  modbus:
+    name: "Modbus TCP"
+    description: >-
+      Nur bei session_source "modbus". host ist IP oder Hostname der Wallbox,
+      port meist 502, unit_id die Slave-Adresse, function_code 3 fuer Holding-
+      oder 4 fuer Input-Register. poll_interval in Sekunden (mindestens 1).
+      rfid_hold_seconds setzt einen haftenden Tag selbst zurueck, weil viele
+      Register die letzte Karte dauerhaft behalten. fixed_login ordnet alle
+      Ladungen einem Dolibarr-Benutzer zu, wenn die Wallbox keinen Tag liefert.
+      Unter registers muss mindestens energy stehen: address, type, word_order
+      (big oder little, je Hersteller unterschiedlich) und scale, etwa 0.001 um
+      Wh in kWh umzurechnen. state nimmt zusaetzlich state_map in der Form
+      "3:Charging", weil viele Wallboxen den Zustand als Zahl melden. Eine
+      unbrauchbare Registerkarte laesst das Addon absichtlich nicht starten,
+      statt stillschweigend 0 kWh abzurechnen.
+
   api:
     name: "Dolibarr-API-Konfiguration"
     description: >-
       Verbindungsdaten zum Dolibarr-ERP für die automatische Übertragung
       abgeschlossener Sessions in die Spesenabrechnung.
+
+network:
+  9000/tcp: "OCPP-Zentralserver (nur bei session_source: ocpp)"

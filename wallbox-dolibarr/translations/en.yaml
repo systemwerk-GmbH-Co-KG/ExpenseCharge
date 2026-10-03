@@ -23,6 +23,39 @@ configuration:
     description: >-
       List of allowed RFID tag IDs (hex strings, e.g. "A1B2C3D4"). All
       other tags are ignored. Has no effect when auth_mode is "none".
+      In OCPP mode the comparison is case-insensitive; enter cards in
+      UPPERCASE in Dolibarr.
+
+  session_source:
+    name: "Data source / operating mode"
+    description: >-
+      "ha_sensors": charging sessions are derived from Home Assistant sensors
+      (wallbox_profile, sensor_*). "ocpp": ExpenseCharge acts as the OCPP
+      server itself — the wallbox connects directly and unknown cards are
+      rejected. In that case also fill in ocpp_charge_points and expose port
+      9000/tcp under "Network".
+
+  ocpp_charge_points:
+    name: "OCPP wallboxes"
+    description: >-
+      Only with session_source "ocpp". Per wallbox: id = charge point ID (last
+      part of the connection URL; an unknown ID is printed to the log after the
+      first connection attempt), optional password (basic auth, at least 16
+      characters; empty = no password, trusted LAN only) and optional
+      wallbox_id (name in Dolibarr, defaults to id).
+
+  ocpp_heartbeat_interval:
+    name: "OCPP heartbeat (seconds)"
+    description: >-
+      Interval announced to the wallbox when it registers (30–3600).
+
+  ocpp_apply_recommended_config:
+    name: "Apply recommended wallbox settings"
+    description: >-
+      When enabled, ExpenseCharge sets MeterValueSampleInterval=60,
+      MeterValuesSampledData=Energy.Active.Import.Register and
+      StopTransactionOnInvalidId=true after every wallbox boot. Off by
+      default — nothing is changed on the wallbox without consent.
 
   wallbox_profile:
     name: "Wallbox profile"
@@ -138,6 +171,14 @@ configuration:
       Only needed as a fallback if the addon cannot authenticate via the
       supervisor.
 
+  rfid_hold_seconds:
+    name: "RFID hold time (seconds)"
+    description: >-
+      0 = off (default). Some sources keep the last tag indefinitely — the
+      Alfen integration derives it from the transaction log, i.e. from the
+      last COMPLETED charging session. The value then sticks and confuses
+      state detection. With a value above 0, ExpenseCharge resets the tag to
+      "no tag" itself after that time. 1.0 is a good starting point.
   min_session_kwh:
     name: "Minimum kWh per session"
     description: >-
@@ -153,8 +194,128 @@ configuration:
       generously so normal load-management pauses aren't affected
       (default 24h).
 
+  web_port:
+    name: "Web UI port"
+    description: >-
+      Port the web interface listens on (inside the container). Leave at the
+      ingress port 8099 when running as an addon.
+
+  web_bind:
+    name: "Web UI bind address"
+    description: >-
+      Address the web interface binds to. Use 0.0.0.0 as an addon; ingress
+      connects from outside. Standalone without a reverse proxy, prefer
+      127.0.0.1 — there is no HA login protecting it there.
+
+  ocpp_port:
+    name: "OCPP server port"
+    description: >-
+      Container port the OCPP server listens on. The externally reachable port
+      is mapped under Network in HA.
+
+  ocpp_bind:
+    name: "OCPP server bind address"
+    description: >-
+      Address the OCPP server binds to. Keep 0.0.0.0 so the wallbox can reach
+      it.
+
+  debounce_seconds:
+    name: "RFID debounce (seconds)"
+    description: >-
+      Lockout after a tag is read so a double read cannot trigger two sessions.
+      Raise it if the reader reports the same tag repeatedly.
+
+  max_plausible_kw:
+    name: "Power plausibility limit (kW)"
+    description: >-
+      If a session average power exceeds this, it is treated as a meter or unit
+      error and is NOT billed but marked incomplete. 50 suits AC wallboxes at up
+      to 22 kW. Raise it for a DC charger, otherwise every fast charge ends up
+      needing manual review.
+
+  max_discard_hours:
+    name: "Short-session window (hours)"
+    description: >-
+      If a session stays below min_session_kwh, it counts as card held but never
+      charged up to this duration and is discarded. Longer than that it is a
+      meter fault and becomes visible as incomplete — typical for a wallbox
+      reporting kWh instead of Wh.
+
+  pending_auth_window:
+    name: "Held-card validity (seconds)"
+    description: >-
+      How long a presented tag stays valid for a later charge start. Matters
+      with load management, which can delay the start by hours.
+
+  api_timeout:
+    name: "Dolibarr timeout (seconds)"
+    description: >-
+      Timeout per request to Dolibarr. Increase on a slow connection.
+
+  api_retries:
+    name: "Dolibarr retries"
+    description: >-
+      Retries on overload or server error (429/5xx). 0 disables them.
+      Untransmitted sessions stay in the local buffer and are retried later
+      anyway.
+
+  api_backoff:
+    name: "Dolibarr backoff factor"
+    description: >-
+      Growing wait between retries. Careful: a high value times many retries
+      adds up to minutes.
+
+  learn_ttl_seconds:
+    name: "Learn mode: plaintext hold time (seconds)"
+    description: >-
+      How long a detected card plaintext ID stays visible in memory so you can
+      name it. It disappears afterwards. Only the hash is ever stored, never the
+      plaintext.
+
+  learn_max_entries:
+    name: "Learn mode: max cards listed"
+    description: >-
+      How many detected cards the learn mode keeps at once.
+
+  trend_days:
+    name: "Trend strip: window (days)"
+    description: >-
+      How many days the strip on the start page covers.
+
+  alfen:
+    name: "Alfen HTTPS API"
+    description: >-
+      Only with session_source "alfen_http". host is the wallbox IP, hostname or
+      full URL; https is assumed when no scheme is given. username and password
+      are the wallbox credentials, not the Dolibarr ones. verify_ssl stays off
+      because Alfen ships a self-signed certificate. poll_interval is the rate
+      for meter and state (display), transaction_interval the rate for the
+      transaction log (billing) — reading the log is expensive, hence less
+      often. param_energy and param_state are the Alfen parameter IDs,
+      defaulting to 2221_22 and 2501_1 for socket 1. fixed_login attributes
+      every session to one Dolibarr user when no card is available. An
+      incomplete configuration deliberately stops the addon from starting.
+
+  modbus:
+    name: "Modbus TCP"
+    description: >-
+      Only with session_source "modbus". host is the wallbox IP or hostname,
+      port usually 502, unit_id the slave address, function_code 3 for holding
+      or 4 for input registers. poll_interval in seconds (at least 1).
+      rfid_hold_seconds resets a sticky tag itself, because many registers keep
+      the last card indefinitely. fixed_login attributes every session to one
+      Dolibarr user when the wallbox provides no tag. Under registers, energy is
+      mandatory: address, type, word_order (big or little, differs per vendor)
+      and scale, e.g. 0.001 to convert Wh to kWh. state additionally takes
+      state_map in the form "3:Charging", because many wallboxes report the
+      state as a number. An unusable register map deliberately stops the addon
+      from starting instead of silently billing 0 kWh.
+
   api:
     name: "Dolibarr API configuration"
     description: >-
       Connection details for the Dolibarr ERP used to automatically
       transmit completed sessions into the expense report.
+
+network:
+  9000/tcp: "OCPP central system (only with session_source: ocpp)"

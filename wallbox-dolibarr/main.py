@@ -45,7 +45,23 @@ import wallbox_profile
 from api_client import WallboxApiClient
 
 # Ingress Web-Server für manuelle Sessions
-from web_server import start_web_server
+from web_server import note_transmit_result, start_web_server
+from tag_release import TagReleaser
+from tag_learning import LearnBuffer
+from app_settings import resolve_app_settings
+import env_config
+from env_config import apply_env_overrides
+from admin import is_standalone
+from admin import logs as admin_logs
+from admin.web import AdminContext, new_setup_code
+from placeholders import find_placeholders
+from ocpp_server.central_system import CentralSystemDeps
+from ocpp_server.server import OCPP_PORT, OcppServer
+from ocpp_server.settings import resolve_ocpp_settings
+from modbus_source.poller import ModbusPoller
+from modbus_source.settings import ModbusConfigError, resolve_modbus_settings
+from alfen_source.runner import AlfenRunner
+from alfen_source.settings import AlfenConfigError, resolve_alfen_settings
 
 # Logging Setup (D-17, D-20)
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -54,6 +70,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 _LOGGER = logging.getLogger(__name__)
+if is_standalone():
+    admin_logs.install()   # System-Log der Oberfläche ab der ersten Zeile
 
 # RFID-Werte die als "keine Karte" interpretiert werden
 _RFID_NONE_VALUES = {'', 'no tag', 'no_tag', 'none', 'unknown', 'unavailable'}
@@ -62,7 +80,7 @@ _RFID_NONE_VALUES = {'', 'no tag', 'no_tag', 'none', 'unknown', 'unavailable'}
 # "memoriert" wird, falls erst SPÄTER der Charging-Power-On-State kommt.
 # Alfen brauchst manchmal Minuten zwischen NFC-Auth und tatsächlichem
 # Charging-Start (Auto wird erst danach angesteckt).
-_PENDING_AUTH_WINDOW = 600  # 10 Minuten
+_PENDING_AUTH_WINDOW = 600  # 10 Minuten (Vorgabe; app_settings.pending_auth_window gilt)
 
 # Letzte erkannte autorisierte RFID — wird vom Charging-State-Trigger
 # als Fallback verwendet, falls der RFID-Event verpasst wurde.
@@ -92,6 +110,24 @@ _last_energy_change_time = None  # float (time.time()) oder None
 
 # Platzhalter-Identität für auth_mode='none' (keine Autorisierungspflicht).
 _NO_AUTH_RFID = "NO_AUTH_REQUIRED"
+
+# Sofort-Übertragung anstoßen (z.B. nach einer OCPP-StopTransaction), statt
+# auf das nächste transmit_interval zu warten.
+_transmit_requested = asyncio.Event()
+
+# Setzt den RFID-Wert selbst auf "kein Tag" zurück, wenn der Sensor ihn hält.
+# None = abgeschaltet (Default): dann bleibt das Verhalten exakt wie bisher.
+# Nötig z.B. bei der Alfen-Integration, die den Tag aus dem Transaktions-Log
+# ableitet — dort steht dauerhaft die letzte Karte.
+_tag_releaser = None
+
+# Lernmodus: hält zuletzt vorgehaltene Karten flüchtig im Speicher, damit der
+# Admin sie in der Oberfläche benennen und einordnen kann. Standardmäßig aus.
+learn_buffer = LearnBuffer()
+
+# Wirksame Betriebsparameter. Wird in main() aus der Konfiguration ersetzt;
+# die Vorgaben hier entsprechen dem bisherigen Verhalten.
+app_settings = resolve_app_settings({})
 
 
 def _parse_energy(value):
@@ -129,36 +165,73 @@ api_client = None
 api_state = None  # Live-Zustand für Web-Server (current_energy, wallbox_state)
 
 
+# Datenverzeichnis. /data ist richtig im Addon- und Docker-Betrieb (dort als
+# Volume gemountet). Ohne Docker — systemd-Dienst auf einem Pi, lokales
+# Ausprobieren — gibt es kein /data und es lässt sich auch nicht anlegen; dann
+# zeigt EXPENSECHARGE_DATA auf ein beschreibbares Verzeichnis.
+DEFAULT_DATA_DIR = '/data'
+
+
+def data_dir() -> str:
+    """Verzeichnis für options.json und sessions.db."""
+    return (os.getenv('EXPENSECHARGE_DATA') or DEFAULT_DATA_DIR).rstrip('/') or '/'
+
+
+def config_path() -> str:
+    return os.path.join(data_dir(), 'options.json')
+
+
+def db_path() -> str:
+    return os.path.join(data_dir(), 'sessions.db')
+
+
+def warn_if_web_exposed(has_account: bool) -> None:
+    """Standalone: Web-UI über WEB_BIND im Netz, aber noch ohne Admin-Konto."""
+    if os.getenv('SUPERVISOR_TOKEN'):
+        return   # HA-Addon: Ingress mit HA-Login davor
+    bind = os.getenv('WEB_BIND', '127.0.0.1').strip()
+    if bind not in ('127.0.0.1', 'localhost', '::1') and not has_account:
+        _LOGGER.warning("Web-UI ist über WEB_BIND=%s im Netz erreichbar und noch OHNE Admin-Konto — "
+                        "jetzt im Browser die Ersteinrichtung abschließen (Einrichtungscode steht eine Zeile darüber). "
+                        "Bis dahin ist die Oberfläche nur lesend.", bind)
+
+
 def load_config():
-    """Lädt Addon-Konfiguration aus /data/options.json (D-04)"""
-    config_path = '/data/options.json'
-    try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-            _LOGGER.info("Konfiguration geladen von %s", config_path)
-
-            if isinstance(config.get('ha_token'), str):
-                config['ha_token'] = config['ha_token'].strip()
-
-            # API-Konfiguration validieren (Task 3)
-            api_config = config.get('api', {})
-            if api_config:
-                for key in ('dolibarr_url', 'api_token'):
-                    if isinstance(api_config.get(key), str):
-                        api_config[key] = api_config[key].strip()
-
-                dolibarr_url = api_config.get('dolibarr_url', '')
-                if dolibarr_url and not (dolibarr_url.startswith('http://') or dolibarr_url.startswith('https://')):
-                    _LOGGER.warning("API-Konfiguration: dolibarr_url muss mit http:// oder https:// beginnen")
-
-                api_token = api_config.get('api_token', '')
-                if not api_token or api_token == 'your_dolapikey_here':
-                    _LOGGER.warning("API-Token nicht konfiguriert oder noch Default-Wert")
-
-            return config
-    except Exception as e:
-        _LOGGER.error("Fehler beim Laden der Konfiguration: %s", e)
+    """Lädt die Addon-Konfiguration aus <Datenverzeichnis>/options.json (D-04)"""
+    path = config_path()
+    config = {}
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                config = json.load(f)
+            _LOGGER.info("Konfiguration geladen von %s", path)
+        except Exception as e:
+            _LOGGER.error("Fehler beim Laden der Konfiguration %s: %s", path, e)
+    # Umgebung (EC_*) hat Vorrang — ungültiges JSON dort bricht bewusst ab.
+    config = apply_env_overrides(config, os.environ)
+    if not config:
+        _LOGGER.error("Keine Konfiguration: weder %s noch EC_*-Umgebungsvariablen", path)
         return {}
+
+    if isinstance(config.get('ha_token'), str):
+        config['ha_token'] = config['ha_token'].strip()
+
+    # API-Konfiguration validieren (Task 3)
+    api_config = config.get('api', {})
+    if api_config:
+        for key in ('dolibarr_url', 'api_token'):
+            if isinstance(api_config.get(key), str):
+                api_config[key] = api_config[key].strip()
+
+        dolibarr_url = api_config.get('dolibarr_url', '')
+        if dolibarr_url and not (dolibarr_url.startswith('http://') or dolibarr_url.startswith('https://')):
+            _LOGGER.warning("API-Konfiguration: dolibarr_url muss mit http:// oder https:// beginnen")
+
+        api_token = api_config.get('api_token', '')
+        if not api_token or api_token == 'your_dolapikey_here':
+            _LOGGER.warning("API-Token nicht konfiguriert oder noch Default-Wert")
+
+    return config
 
 
 class HomeAssistantWebsocket:
@@ -470,6 +543,14 @@ async def sensor_callback(entity_id: str, state: Dict[str, Any]):
     # ----- RFID-Sensor (Session-Start / ggf. Session-Ende bei tag_toggle) ---
     if entity_id == sensor_rfid and sensor_rfid:
         sv = (state_value or '').strip()
+
+        # Haftenden Sensorwert in ein Flankensignal verwandeln (optional).
+        if _tag_releaser is not None:
+            decided = _tag_releaser.observe(sv)
+            if decided is None:
+                return                  # nichts Neues — Wert haftet nur
+            sv = decided                # '' = Rückfall auf "kein Tag"
+
         sv_low = sv.lower()
 
         # "No Tag" / unknown: Bei Auto-Reset-Wallboxen (Alfen-Integration setzt
@@ -483,6 +564,12 @@ async def sensor_callback(entity_id: str, state: Dict[str, Any]):
 
         # Anliegenden Tag cachen (auch vor Debounce/Whitelist — für Charging-Fallback)
         _latest_rfid = sv
+
+        # Lernmodus: jede vorgehaltene Karte sichtbar machen, auch eine noch
+        # nicht eingeordnete — sonst kann sie der Admin nie freischalten.
+        # Der Klartext bleibt dabei flüchtig im Speicher; persistiert wird nur
+        # der Hash.
+        note_tag_seen(sv)
 
         # Echter Tag erkannt — Debounce + Whitelist
         if not session_manager.debounce_rfid(sv):
@@ -688,26 +775,360 @@ async def check_startup_session():
             _pending_auth = {'rfid_hex': rfid_val, 'time': time.time()}
 
 
+async def probe_dolibarr(url: str) -> None:
+    """Prüft Dolibarr im Hintergrund und meldet das Ergebnis.
+
+    api_state['client'] wird erst bei erreichbarem Dolibarr gesetzt — die
+    Oberfläche lädt darüber die Mitarbeiterliste. Die Übertragung hängt NICHT
+    davon ab, sie versucht es in jedem Intervall selbst.
+    """
+    client = api_client
+    if client is None:
+        return
+    ok = await asyncio.to_thread(client.check_connection)
+    if ok:
+        api_state['client'] = client
+        _LOGGER.info("Dolibarr API Verbindung erfolgreich: %s", url)
+    else:
+        _LOGGER.warning("Dolibarr unter %s gerade nicht erreichbar — Ladungen bleiben im "
+                        "lokalen Puffer und werden in jedem Intervall erneut übertragen", url)
+
+
+_transmission_task = None
+_ocpp_server = None
+
+
+def ensure_transmission() -> None:
+    """Startet die periodische Übertragung genau einmal (auch nachträglich per Oberfläche)."""
+    global _transmission_task
+    if _transmission_task is None or _transmission_task.done():
+        _transmission_task = asyncio.create_task(periodic_transmission())
+
+
+def reload_dolibarr(url: str, token: str) -> None:
+    """Hot-Reload aus der Oberfläche: neuer API-Client, Übertragung läuft weiter."""
+    global api_client
+    api_client = WallboxApiClient(base_url=url, api_token=token,
+                                  timeout=app_settings.api_timeout,
+                                  retries=app_settings.api_retries,
+                                  backoff=app_settings.api_backoff)
+    api_state['client'] = None
+    asyncio.create_task(probe_dolibarr(url))
+    ensure_transmission()
+    _transmit_requested.set()
+    _LOGGER.info("Dolibarr-Zugang aus der Oberfläche übernommen: %s", url)
+
+
+def request_transmission() -> None:
+    """Sofortige Übertragung aus der Oberfläche (läuft im Übertragungs-Task)."""
+    ensure_transmission()
+    _transmit_requested.set()
+
+
+def reload_ocpp() -> bool:
+    """Neue ocpp_charge_points ohne Neustart — nur, wenn der OCPP-Server schon läuft."""
+    if _ocpp_server is None:
+        return False
+    _ocpp_server.update_settings(resolve_ocpp_settings(current_config))
+    _LOGGER.info("OCPP-Wallboxen aus der Oberfläche übernommen")
+    return True
+
+
+def restart_process() -> None:
+    # ponytail: harter Exit, Docker (restart: unless-stopped) startet neu. Ohne
+    # Neustartrichtlinie bleibt der Container aus — steht so in der Oberfläche.
+    _LOGGER.warning("Neustart aus der Oberfläche angefordert")
+    logging.shutdown()
+    os._exit(0)
+
+
+def build_admin_context():
+    """Standalone: Anmeldung/Assistent. Übernimmt ein altes web_auth als Admin-Konto."""
+    ctx = AdminContext(data_dir=data_dir(), config=current_config, session_manager=session_manager,
+                       ocpp_port=app_settings.ocpp_port, reload_dolibarr=reload_dolibarr,
+                       reload_ocpp=reload_ocpp, restart=restart_process, ocpp=lambda: _ocpp_server,
+                       transmit_now=request_transmission)
+    auth = current_config.get('web_auth') or {}
+    if not ctx.accounts.exists() and auth.get('username') and auth.get('password'):
+        ctx.accounts.create(str(auth['username']), str(auth['password']))
+        ctx.audit.record('system', 'admin_konto', None, auth['username'], 'aus web_auth übernommen')
+        _LOGGER.info("web_auth als Admin-Konto übernommen (Passwort jetzt gehasht in data/admin.json)")
+    if 'web_auth' in ctx.store.load():
+        ctx.store.remove('web_auth')
+        _LOGGER.info("web_auth aus options.json entfernt — Klartext-Passwort wird nicht mehr gebraucht")
+    if env_config.env_overrides('web_auth.password'):
+        _LOGGER.info("EC_WEB_AUTH__* wird nicht mehr gebraucht und kann aus der .env entfernt werden")
+    current_config.pop('web_auth', None)
+    if not ctx.accounts.exists():
+        ctx.setup_code = new_setup_code()
+        _LOGGER.warning("Ersteinrichtung offen — Einrichtungscode: %s  (Web-UI → Ersteinrichtung, "
+                        "Port %d)", ctx.setup_code, app_settings.web_port)
+    return ctx
+
+
+async def periodic_transmission():
+    """Periodische (und auf Anforderung sofortige) Übertragung an Dolibarr."""
+    last_transmit = 0.0
+    transmit_interval = current_config.get("api", {}).get("transmit_interval", 300)
+    while True:
+        if api_client:
+            now = time.time()
+            if (now - last_transmit) >= transmit_interval or _transmit_requested.is_set():
+                _manual = _transmit_requested.is_set()
+                _transmit_requested.clear()
+                last_transmit = now
+                try:
+                    # In einen Thread auslagern: transmit_completed_sessions ist
+                    # synchrones requests mit Retry-Backoff und kann bei einem
+                    # hängenden Dolibarr Minuten dauern. Im OCPP-Betrieb ist dieser
+                    # Event-Loop derselbe, der die Wallbox bedient — er darf nicht
+                    # stehenbleiben, sonst läuft die Wallbox in ihren Timeout.
+                    result = await asyncio.to_thread(
+                        session_manager.transmit_completed_sessions, api_client)
+                    if result["transmitted"] or result["failed"] or _manual:
+                        note_transmit_result(api_state, result)
+                    if result["transmitted"] > 0:
+                        _LOGGER.info("Sessions an Dolibarr übertragen: %s", result["transmitted"])
+                        if api_state is not None and not api_state.get('client'):
+                            api_state['client'] = api_client
+                    if result["failed"] > 0:
+                        _LOGGER.error("Fehler bei API-Übertragung: %s Sessions fehlgeschlagen",
+                                      result["failed"])
+                        if not await asyncio.to_thread(api_client.check_connection):
+                            _LOGGER.warning("API-Verbindung verloren - deaktiviere temporär")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Eine Ausnahme darf diesen Task nicht für den Rest der
+                    # Prozesslaufzeit beenden — im OCPP-Betrieb gibt es keinen
+                    # zweiten Auslöser für die Übertragung.
+                    _LOGGER.exception("Übertragung an Dolibarr fehlgeschlagen: %s", exc)
+        await asyncio.sleep(1)
+
+
+def note_tag_seen(tag: str) -> bool:
+    """Eine vorgehaltene Karte für den Lernmodus festhalten.
+
+    Zwei Dinge: Klartext flüchtig in den Puffer (damit der Admin sie in der
+    Oberfläche sieht) und den Hash in die Tag-Verwaltung (damit sie dort zum
+    Benennen auftaucht). Nur aktiv, wenn der Lernmodus eingeschaltet ist.
+    """
+    if not learn_buffer.observe(tag):
+        return False
+    try:
+        session_manager.note_tag_seen(tag)
+    except Exception as exc:
+        _LOGGER.warning("Tag konnte nicht vermerkt werden: %s", exc)
+    return True
+
+
+def build_ocpp_server(settings) -> OcppServer:
+    """Verdrahtet den OCPP-Server mit SessionManager, Whitelist und Live-Zustand."""
+    api_state['charge_points'] = {}
+    deps = CentralSystemDeps(
+        session_manager=session_manager,
+        whitelist=current_config.get('rfid_whitelist', []),
+        live=api_state['charge_points'],
+        min_kwh=float(current_config.get('min_session_kwh', 0.05)),
+        heartbeat_interval=settings.heartbeat_interval,
+        apply_recommended_config=settings.apply_recommended_config,
+        on_session_completed=lambda _session: _transmit_requested.set(),
+        on_tag_seen=note_tag_seen,
+    )
+    return OcppServer(settings, deps)
+
+
+def ocpp_overdue_sessions(max_hours: float, now: Optional[datetime] = None) -> list:
+    """Aktive OCPP-Sessions, die länger als max_hours laufen."""
+    now = now or datetime.now()
+    overdue = []
+    for s in session_manager.get_active_ocpp_sessions():
+        try:
+            age_h = (now - datetime.fromisoformat(s['start_time'])).total_seconds() / 3600.0
+        except (TypeError, ValueError):
+            continue
+        if age_h >= max_hours:
+            overdue.append(s)
+    return overdue
+
+
+async def ocpp_stale_session_guard():
+    """Im OCPP-Betrieb beendet NUR die Wallbox eine Session (StopTransaction,
+    ggf. verspätet aus ihrer Offline-Queue). Die Wache warnt daher nur einmal
+    je Session, statt sie mit einem geratenen Zählerstand zu schließen."""
+    max_hours = float(current_config.get("max_session_hours", 24))
+    warned = set()
+    while True:
+        await asyncio.sleep(300)
+        try:
+            for s in ocpp_overdue_sessions(max_hours):
+                if s['id'] not in warned:
+                    warned.add(s['id'])
+                    _LOGGER.warning("OCPP-Session #%s (%s) läuft seit über %.0f h — Wallbox erreichbar? "
+                                    "Wird erst mit ihrer StopTransaction abgeschlossen.",
+                                    s['id'], s['charge_point_id'], max_hours)
+        except Exception as exc:  # Wache darf nie den Loop killen
+            _LOGGER.warning("ocpp_stale_session_guard Fehler: %s", exc)
+
+
+async def run_ocpp_mode(settings) -> None:
+    """Betriebsart session_source=ocpp: kein HA-Websocket, die Wallbox verbindet sich direkt."""
+    if not settings.charge_points:
+        _LOGGER.error("session_source=ocpp, aber keine ocpp_charge_points konfiguriert — "
+                      "jede Wallbox wird abgewiesen")
+    global _ocpp_server
+    server = build_ocpp_server(settings)
+    _ocpp_server = server
+    await server.start(app_settings.ocpp_bind, app_settings.ocpp_port)
+    # KEINE Restart-Recovery wie im HA-Pfad: offene Sessions bleiben 'active' —
+    # die Wallbox liefert StopTransaction aus ihrer Offline-Queue nach.
+    open_sessions = session_manager.get_active_ocpp_sessions()
+    if open_sessions:
+        _LOGGER.info("%d laufende OCPP-Session(s) aus der Zeit vor dem Neustart — warte auf StopTransaction",
+                     len(open_sessions))
+    asyncio.create_task(ocpp_stale_session_guard())
+    if api_client:
+        ensure_transmission()
+    asyncio.create_task(start_web_server(session_manager, current_config, api_state,
+                                         port=app_settings.web_port,
+                                         host=app_settings.web_bind))
+    await server.serve_forever()
+
+
+def build_modbus_poller(settings) -> ModbusPoller:
+    """Verdrahtet den Modbus-Poller mit der bestehenden Session-Logik.
+
+    Die gelesenen Register werden unter den Entity-IDs des Wallbox-Profils
+    gemeldet — damit landet alles in derselben sensor_callback wie im
+    Home-Assistant-Pfad, und die ganze getestete Auth- und Zustandslogik
+    (Whitelist, Debounce, auth_mode, state_mode) gilt unverändert.
+    """
+    entity_ids = {
+        'energy': profile.sensor_energy,
+        'state': profile.sensor_state,
+        'rfid': profile.sensor_rfid,
+        'power': profile.power_sensor or 'modbus.power',
+    }
+    return ModbusPoller(settings, entity_ids=entity_ids,
+                        callback=lambda entity_id, state: sensor_callback(entity_id, state))
+
+
+async def run_modbus_mode(settings) -> None:
+    """Betriebsart session_source=modbus: kein HA-Websocket, die Wallbox wird
+    direkt abgefragt."""
+    poller = build_modbus_poller(settings)
+
+    # Restart-Recovery wie im HA-Pfad: der Zählerstand kommt beim ersten
+    # Durchlauf von der Wallbox, also erst lesen, dann aufräumen.
+    await poller.poll_once()
+    await check_startup_session()
+
+    asyncio.create_task(stale_session_guard_modbus())
+    if api_client:
+        ensure_transmission()
+    asyncio.create_task(start_web_server(session_manager, current_config, api_state,
+                                         port=app_settings.web_port,
+                                         host=app_settings.web_bind))
+    await poller.run()
+
+
+async def stale_session_guard_modbus():
+    """Sicherung gegen hängende Sessions im Modbus-Betrieb.
+
+    Anders als bei OCPP ist hier kein verspäteter Stop der Wallbox zu erwarten:
+    der Zustand wird gepollt. Eine Session, die trotzdem ewig offen bleibt,
+    wird daher wie im HA-Pfad geschlossen — mit dem letzten gelesenen Zähler.
+    """
+    max_hours = float(current_config.get("max_session_hours", 24))
+    while True:
+        await asyncio.sleep(300)
+        try:
+            active = session_manager.get_active_session()
+            if not active:
+                continue
+            age_h = (datetime.now()
+                     - datetime.fromisoformat(active['start_time'])).total_seconds() / 3600.0
+            if age_h >= max_hours:
+                _LOGGER.warning("Session #%s läuft seit %.1f h — wird geschlossen",
+                                active['id'], age_h)
+                await _end_active_session('stale_guard_modbus')
+        except Exception as exc:
+            _LOGGER.warning("stale_session_guard_modbus Fehler: %s", exc)
+
+
+def build_alfen_runner(settings) -> AlfenRunner:
+    """Verdrahtet die Alfen-HTTP-Quelle.
+
+    Anders als bei Modbus und dem HA-Pfad läuft hier NICHTS über
+    sensor_callback: die Abrechnung kommt aus dem Transaktions-Log der Wallbox,
+    das fertige Ladevorgänge mit Karte, Zeitpunkt und Zählerständen liefert.
+    Würde zusätzlich der abgefragte Zustand in die Sensor-Logik laufen, entstünde
+    jede Ladung zweimal.
+    """
+    return AlfenRunner(
+        settings,
+        session_manager=session_manager,
+        api_state=api_state,
+        wallbox_id=current_config.get('wallbox_id', 'alfen_eve'),
+        whitelist=current_config.get('rfid_whitelist', []),
+        on_tag_seen=note_tag_seen,
+    )
+
+
+async def run_alfen_mode(settings) -> None:
+    """Betriebsart session_source=alfen_http: kein HA, kein OCPP-Backend-Slot."""
+    runner = build_alfen_runner(settings)
+    if api_client:
+        ensure_transmission()
+    asyncio.create_task(start_web_server(session_manager, current_config, api_state,
+                                         port=app_settings.web_port,
+                                         host=app_settings.web_bind))
+    await runner.run()
+
+
 async def main():
     """Hauptschleife (D-03, D-10, D-11) - erweitert für Session-Tracking und API-Transmission"""
-    global session_manager, current_config, ha_ws, api_client, api_state, profile
+    global session_manager, current_config, ha_ws, api_client, api_state, profile, _tag_releaser
+    global app_settings
 
     _LOGGER.info("Wallbox-Dolibarr Addon startet...")
 
-    # Session Manager initialisieren (PER-01)
-    session_manager = SessionManager(db_path="/data/sessions.db")
-
-    # Konfiguration laden (für Whitelist und API)
+    # Konfiguration ZUERST laden — daraus kommen auch die Betriebsparameter.
     current_config = load_config()
+
+    # Betriebsparameter auflösen und das Protokoll-Level anwenden. Die Option
+    # log_level existierte bisher, wurde aber nie ausgewertet: der Level stand
+    # fest auf INFO. LOG_LEVEL in der Umgebung hat weiterhin Vorrang.
+    app_settings = resolve_app_settings(current_config)
+    logging.getLogger().setLevel(getattr(logging, app_settings.log_level, logging.INFO))
+    if app_settings.log_level != LOG_LEVEL:
+        _LOGGER.info("Protokoll-Detailgrad: %s", app_settings.log_level)
+
+    learn_buffer.ttl_seconds = app_settings.learn_ttl_seconds
+    learn_buffer.max_entries = app_settings.learn_max_entries
+
+    # Session Manager initialisieren (PER-01)
+    session_manager = SessionManager(
+        db_path=db_path(),
+        debounce_seconds=app_settings.debounce_seconds,
+        max_plausible_kw=app_settings.max_plausible_kw,
+        max_discard_hours=app_settings.max_discard_hours,
+    )
 
     # Wallbox-Profil auflösen (Auth-/Zustand-Modus, Sensoren, Schwellenwerte).
     # 'alfen_eve' (Default) liefert exakt das bewährte, bisherige Verhalten.
     profile = wallbox_profile.resolve_profile(current_config)
-    _LOGGER.info(
-        "Wallbox-Profil: %s (auth_mode=%s, state_mode=%s, rfid=%s, energy=%s, state=%s)",
-        current_config.get('wallbox_profile', 'alfen_eve'), profile.auth_mode, profile.state_mode,
-        profile.sensor_rfid, profile.sensor_energy, profile.sensor_state,
-    )
+    # Nur bei ha_sensors relevant — sonst nennt das Log Sensoren, die gar nicht gelesen werden.
+    if current_config.get('session_source', 'ha_sensors') == 'ha_sensors':
+        _LOGGER.info(
+            "Wallbox-Profil: %s (auth_mode=%s, state_mode=%s, rfid=%s, energy=%s, state=%s)",
+            current_config.get('wallbox_profile', 'alfen_eve'), profile.auth_mode, profile.state_mode,
+            profile.sensor_rfid, profile.sensor_energy, profile.sensor_state,
+        )
+    placeholders = find_placeholders(current_config)
+    for field in placeholders:
+        _LOGGER.error("Platzhalter in %s nicht ersetzt: %s%s", config_path(), field,
+                      " – im Browser unter Einrichtung beheben" if is_standalone() else "")
 
     # API Client initialisieren — flat config (dolibarr_url auf Top-Level)
     api_client = None
@@ -715,31 +1136,75 @@ async def main():
     # und vom Web-Server für die Live-Anzeige laufender Sessions gelesen.
     api_state  = {
         'client': None,
+        # Lernmodus für die Oberfläche (Ein/Aus + flüchtig erkannte Karten)
+        'learn': learn_buffer,
+        # Wirksame Betriebsparameter für den System-Tab
+        'settings': app_settings,
         'current_energy': None,    # aktueller Energiezähler-Stand in kWh
         'wallbox_state': None,     # 'Charging' / 'Idle' / 'Stopped' / None
         'last_update': None,       # ISO-Timestamp der letzten Sensor-Aktualisierung
     }
+    if is_standalone():
+        api_state['admin'] = build_admin_context()
+        warn_if_web_exposed(api_state['admin'].accounts.exists())
     api_config   = current_config.get("api", {})
     dolibarr_url = api_config.get("dolibarr_url", "")
     api_token    = api_config.get("api_token", "")
-    if dolibarr_url and dolibarr_url != "https://dolibarr.example.com" and api_token:
+    if any(p.startswith('api.') for p in placeholders):
+        _LOGGER.error("Dolibarr-Übertragung deaktiviert, bis die Platzhalter ersetzt sind")
+    elif dolibarr_url and api_token:
         try:
             api_client = WallboxApiClient(
                 base_url=dolibarr_url,
                 api_token=api_token,
-                timeout=30
+                timeout=app_settings.api_timeout,
+                retries=app_settings.api_retries,
+                backoff=app_settings.api_backoff,
             )
-            if api_client.check_connection():
-                api_state['client'] = api_client
-                _LOGGER.info("Dolibarr API Verbindung erfolgreich: %s", dolibarr_url)
-            else:
-                _LOGGER.warning("Dolibarr API nicht erreichbar — wird später erneut versucht")
-                api_client = None
+            # NICHT hier auf Erreichbarkeit warten und den Client bei Misserfolg
+            # verwerfen: Das blockierte den Start (bis zu Minuten bei einer
+            # verwerfenden Firewall), und ohne Client lief die Übertragung bis
+            # zum nächsten Neustart nie — obwohl das Log "wird später erneut
+            # versucht" meldete. Geprüft wird jetzt im Hintergrund; die
+            # Übertragung läuft ohnehin und wiederholt Fehlgeschlagenes selbst.
+            asyncio.create_task(probe_dolibarr(dolibarr_url))
         except Exception as e:
             _LOGGER.error("Fehler beim Initialisieren des API-Clients: %s", e)
             api_client = None
     else:
         _LOGGER.info("Keine Dolibarr API-Konfiguration — Addon läuft ohne API-Transmission")
+
+    hold = float(current_config.get('rfid_hold_seconds', 0) or 0)
+    if hold > 0:
+        _tag_releaser = TagReleaser(hold_seconds=hold)
+        _LOGGER.info("RFID-Haltezeit aktiv: Tag wird %.1f s nach Erkennung selbst "
+                     "auf \"kein Tag\" zurückgesetzt", hold)
+
+    # Alfen über die HTTPS-API: liefert Zähler, Zustand UND die Karte, ohne
+    # Home Assistant und ohne den OCPP-Backend-Slot der Wallbox zu belegen.
+    alfen_settings = resolve_alfen_settings(current_config)
+    if alfen_settings.enabled:
+        _LOGGER.info("Betriebsart: Alfen HTTP (%s)", alfen_settings.base_url)
+        await run_alfen_mode(alfen_settings)
+        return
+
+    # Modbus TCP: die Wallbox wird direkt abgefragt. Eine unbrauchbare
+    # Registerkarte lässt das Addon absichtlich abbrechen, statt mit
+    # Standardwerten 0 kWh abzurechnen.
+    modbus_settings = resolve_modbus_settings(current_config)
+    if modbus_settings.enabled:
+        _LOGGER.info("Betriebsart: Modbus TCP (%s:%s, Unit %s, alle %.0f s)",
+                     modbus_settings.host, modbus_settings.port,
+                     modbus_settings.unit_id, modbus_settings.poll_interval)
+        await run_modbus_mode(modbus_settings)
+        return
+
+    ocpp_settings = resolve_ocpp_settings(current_config)
+    if ocpp_settings.enabled:
+        _LOGGER.info("Betriebsart: OCPP-Zentralserver (%d Wallbox(en) konfiguriert)",
+                     len(ocpp_settings.charge_points))
+        await run_ocpp_mode(ocpp_settings)
+        return
 
     # HA-Token ermitteln: SUPERVISOR_TOKEN hat Vorrang, Fallback auf ha_token aus Konfiguration
     supervisor_token = os.getenv('SUPERVISOR_TOKEN', '')
@@ -747,9 +1212,13 @@ async def main():
     ha_token = supervisor_token or config_ha_token
     if not ha_token:
         _LOGGER.error(
-            "Kein HA-Token verfügbar! Bitte Long-Lived Access Token unter "
-            "Einstellungen → Profil → Langlebige Zugriffstoken erstellen "
-            "und als 'ha_token' in der Addon-Konfiguration eintragen."
+            "Kein HA-Token verfügbar! Zwei Möglichkeiten: (1) Mit Home Assistant — "
+            "Long-Lived Access Token unter Einstellungen → Profil → Langlebige "
+            "Zugriffstoken erstellen und als 'ha_token' eintragen. "
+            "(2) Ohne Home Assistant (z.B. nur Docker) — session_source auf \"ocpp\" "
+            "setzen: dann verbindet sich die Wallbox direkt mit diesem Container und "
+            "es wird gar kein Home Assistant gebraucht. Die Betriebsart "
+            "\"ha_sensors\" liest HA-Sensoren und funktioniert ohne HA nicht."
         )
     else:
         token_src = 'SUPERVISOR_TOKEN' if supervisor_token else 'ha_token (Konfiguration)'
@@ -764,34 +1233,6 @@ async def main():
 
         # Prüfen ob aktive Session nach Neustart existiert (PER-01)
         await check_startup_session()
-
-        # Periodic API Transmission als Hintergrund-Task (Task 4 - Fix: subscribe_entities blockiert)
-        async def periodic_transmission():
-            """Periodische API-Übertragung als Hintergrund-Task"""
-            import time
-            last_transmit = 0
-            transmit_interval = current_config.get("api", {}).get("transmit_interval", 300)
-
-            while True:
-                if api_client:
-                    current_time = time.time()
-                    if (current_time - last_transmit) >= transmit_interval:
-                        result = session_manager.transmit_completed_sessions(api_client)
-
-                        if result["transmitted"] > 0:
-                            _LOGGER.info("Sessions an Dolibarr übertragen: %s", result["transmitted"])
-
-                        if result["failed"] > 0:
-                            _LOGGER.error("Fehler bei API-Übertragung: %s Sessions fehlgeschlagen", result["failed"])
-                            # Bei Fehlern: Verbindung neu testen
-                            if not api_client.check_connection():
-                                _LOGGER.warning("API-Verbindung verloren - deaktiviere temporär")
-                                # api_client auf None setzen deaktiviert weitere Versuche
-                                # TODO: Reconnect-Logik in Zukunft
-
-                        last_transmit = current_time
-
-                await asyncio.sleep(1)
 
         # Sicherung gegen hängende Sessions: Eine Session endet normalerweise
         # beim Abstecken (state=Available). Falls dieses Event ausbleibt (z.B.
@@ -859,11 +1300,13 @@ async def main():
 
         # Hintergrund-Task starten
         if api_client:
-            transmission_task = asyncio.create_task(periodic_transmission())
+            ensure_transmission()
             _LOGGER.info("API-Transmission Hintergrund-Task gestartet")
 
         # Ingress Web-Server für manuelle Ladevorgänge starten
-        asyncio.create_task(start_web_server(session_manager, current_config, api_state, port=8099))
+        asyncio.create_task(start_web_server(session_manager, current_config, api_state,
+                                         port=app_settings.web_port,
+                                         host=app_settings.web_bind))
         _LOGGER.info("Ingress Web-Server Task gestartet (Port 8099)")
 
         # Sensor-Updates abonnieren (event-basiert, D-10) - blockiert bis zur Unterbrechung

@@ -1,0 +1,55 @@
+# ExpenseCharge standalone — ohne Home Assistant, z.B. auf einem Raspberry Pi.
+#
+# Betriebsarten standalone: alfen_http, ocpp, modbus. "ha_sensors" liest
+# Home-Assistant-Sensoren und braucht zwingend HA.
+#
+#   cp .env.example .env
+#   nano .env                          # Betriebsart, Wallbox, Dolibarr-Zugang
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Raspberry Pi: 64-Bit-OS nötig (aarch64). Für 32-Bit (armv7) gibt es kein
+# Base-Image — siehe build.yaml.
+
+services:
+  expensecharge:
+    container_name: expensecharge
+    build:
+      context: .
+      args:
+        # Multi-Arch-Basis; für einen festgenagelten Build:
+        #   amd64   → ghcr.io/home-assistant/amd64-base:3.23
+        #   aarch64 → ghcr.io/home-assistant/aarch64-base:3.23
+        BUILD_FROM: "${BUILD_FROM:-ghcr.io/home-assistant/base:3.23}"
+    restart: unless-stopped
+
+    # Gesamte Konfiguration (EC_*-Variablen), siehe .env.example.
+    # Alternativ dieselben Variablen direkt in Portainer/Proxmox setzen.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # OHNE TZ laufen alle Zeitstempel in UTC — dann landet eine Ladung
+      # kurz vor Monatsende im falschen Abrechnungsmonat. Immer setzen.
+      TZ: "${TZ:-Europe/Berlin}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # Nur zur Information für die Warnung "UI ohne Anmeldung im Netz".
+      WEB_BIND: "${WEB_BIND:-127.0.0.1}"
+
+    volumes:
+      # Enthält sessions.db (SQLite-Puffer) und optional options.json.
+      # Ohne dieses Volume sind nach jedem Neustart alle noch nicht
+      # übertragenen Ladungen verloren.
+      - ./data:/data
+
+    ports:
+      # OCPP-Zentralserver — hier verbindet sich die Wallbox.
+      # Muss im LAN erreichbar sein, darf NIE ins Internet.
+      - "9000:9000"
+      # Web-UI. Standard nur lokal (127.0.0.1). Fürs LAN/VPN in der .env
+      # WEB_BIND=0.0.0.0 setzen — dann UNBEDINGT web_auth konfigurieren,
+      # standalone gibt es keinen HA-Login davor. Diese Datei bleibt
+      # unverändert, damit git pull nie blockiert.
+      # Nach Änderung: docker compose up -d --force-recreate
+      - "${WEB_BIND:-127.0.0.1}:8099:8099"

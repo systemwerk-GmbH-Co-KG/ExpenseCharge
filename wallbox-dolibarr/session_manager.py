@@ -20,6 +20,27 @@ sys.path.insert(0, '/usr/local/bin')
 from utils.hash import hash_rfid, verify_rfid_hash
 
 # Debounce-Zeit in Sekunden (HA-07)
+# OCPP: Plausibilitätsgrenze für die mittlere Ladeleistung einer Session.
+# AC-Wallboxen liefern max. 22 kW; alles deutlich darüber ist ein Einheiten-
+# oder Zählerfehler (z.B. kWh statt Wh gemeldet) und darf nicht abgerechnet werden.
+_MAX_PLAUSIBLE_KW = 50.0
+
+# Ab dieser Dauer gilt eine Session unter min_session_kwh nicht mehr als
+# "Karte gehalten, nie geladen", sondern als Zählerfehler → incomplete statt
+# still verworfen.
+_MAX_DISCARD_HOURS = 0.25
+
+# Einordnung einer Karte in der Tag-Verwaltung des Addons:
+#   business — Ladung wird an Dolibarr übertragen (Regelfall)
+#   private  — Ladung bleibt LOKAL, erreicht Dolibarr nie
+#   unknown  — nur erkannt, noch nicht eingeordnet: darf NICHT laden
+TAG_MODE_BUSINESS = 'business'
+TAG_MODE_PRIVATE = 'private'
+TAG_MODE_UNKNOWN = 'unknown'
+VALID_TAG_MODES = (TAG_MODE_BUSINESS, TAG_MODE_PRIVATE, TAG_MODE_UNKNOWN)
+# Welche Einordnungen überhaupt laden dürfen.
+_TAG_MODES_MAY_CHARGE = (TAG_MODE_BUSINESS, TAG_MODE_PRIVATE)
+
 DEBOUNCE_SECONDS = 7
 
 
@@ -47,8 +68,20 @@ def format_iso8601(dt: Any) -> str:
 class SessionManager:
     """Verwaltet Lade-Sessions in SQLite"""
 
-    def __init__(self, db_path: str = "/data/sessions.db"):
+    def __init__(self, db_path: str = "/data/sessions.db",
+                 debounce_seconds: float = DEBOUNCE_SECONDS,
+                 max_plausible_kw: float = _MAX_PLAUSIBLE_KW,
+                 max_discard_hours: float = _MAX_DISCARD_HOURS):
+        """Die drei Grenzwerte sind einstellbar, weil sie je Anlage abweichen:
+        eine DC-Säule überschreitet 50 kW, ein träger Leser braucht eine
+        andere Entprellung, und wie lange eine Session unter min_kwh noch als
+        "Karte gehalten" statt als Zählerfehler gilt, hängt vom Standort ab.
+        Die Vorgaben entsprechen genau dem bisherigen Verhalten.
+        """
         self.db_path = db_path
+        self.debounce_seconds = float(debounce_seconds)
+        self.max_plausible_kw = float(max_plausible_kw)
+        self.max_discard_hours = float(max_discard_hours)
         self._logger = logging.getLogger(__name__)  # muss vor _init_database() stehen
         self._last_rfid_time: Dict[str, float] = {}  # Für Debouncing
         self._init_database()
@@ -86,6 +119,12 @@ class SessionManager:
             ('ALTER TABLE sessions ADD COLUMN transmitted_at TEXT', 'transmitted_at'),
             ('ALTER TABLE sessions ADD COLUMN start_energy_valid INTEGER NOT NULL DEFAULT 1', 'start_energy_valid'),
             ('ALTER TABLE sessions ADD COLUMN login TEXT', 'login'),
+            # OCPP-Betrieb (session_source: ocpp) — bei HA-Sensor-Sessions NULL
+            ('ALTER TABLE sessions ADD COLUMN charge_point_id TEXT', 'charge_point_id'),
+            ('ALTER TABLE sessions ADD COLUMN connector_id INTEGER', 'connector_id'),
+            ('ALTER TABLE sessions ADD COLUMN ocpp_start_timestamp TEXT', 'ocpp_start_timestamp'),
+            ('ALTER TABLE sessions ADD COLUMN last_meter_kwh REAL', 'last_meter_kwh'),
+            ('ALTER TABLE sessions ADD COLUMN stop_reason TEXT', 'stop_reason'),
         ]:
             try:
                 cursor.execute(col_ddl)
@@ -106,6 +145,21 @@ class SessionManager:
             )
         ''')
 
+        # Tag-Verwaltung des Addons: benannte Karten mit Einordnung.
+        # Bewusst NUR der Hash — der RFID-Klartext wird nie persistiert
+        # (DSGVO, Datensparsamkeit). Der vom Admin vergebene Name ersetzt ihn
+        # für die Wiedererkennung in der Oberfläche.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tags (
+                rfid_hash  TEXT PRIMARY KEY,
+                label      TEXT,
+                mode       TEXT NOT NULL DEFAULT 'unknown',
+                first_seen TEXT NOT NULL,
+                last_seen  TEXT NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1
+            )
+        ''')
+
         # Index für rfid_hash (DB-02 Vorbereitung)
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_rfid_hash ON sessions(rfid_hash)
@@ -114,6 +168,12 @@ class SessionManager:
         # Index für status (für aktive Sessions)
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_status ON sessions(status)
+        ''')
+
+        # OCPP: Duplikaterkennung wiederholter StartTransaction-Nachrichten
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_ocpp_start
+            ON sessions(charge_point_id, connector_id, ocpp_start_timestamp)
         ''')
 
         conn.commit()
@@ -163,9 +223,9 @@ class SessionManager:
 
         if rfid_hash in self._last_rfid_time:
             time_diff = current_time - self._last_rfid_time[rfid_hash]
-            if time_diff < DEBOUNCE_SECONDS:
+            if time_diff < self.debounce_seconds:
                 self._logger.debug("RFID debounced: %s (%.1fs < %ds)",
-                                rfid_hash[:16], time_diff, DEBOUNCE_SECONDS)
+                                rfid_hash[:16], time_diff, self.debounce_seconds)
                 return False
 
         self._last_rfid_time[rfid_hash] = current_time
@@ -182,11 +242,31 @@ class SessionManager:
         Returns:
             True wenn RFID autorisiert ist
         """
-        if not whitelist:
-            self._logger.warning("Keine RFID-Whitelist konfiguriert")
+        rfid_hash = hash_rfid(rfid_hex)
+
+        # Zuerst die Tag-Verwaltung: wer dort eingeordnet ist, darf laden —
+        # auch ohne Eintrag in der Konfigurations-Whitelist. Das ist der Zweck
+        # des Lernmodus: Karten freischalten, ohne die Konfiguration anzufassen.
+        tag = self._get_tag_by_hash(rfid_hash)
+        if tag is not None:
+            if tag['mode'] in _TAG_MODES_MAY_CHARGE:
+                self._logger.info("RFID autorisiert über Tag-Verwaltung (%s): %s...",
+                                  tag['mode'], rfid_hash[:16])
+                return True
+            self._logger.warning("RFID erkannt, aber noch nicht eingeordnet: %s... "
+                                 "— in der Oberfläche benennen und einordnen", rfid_hash[:16])
             return False
 
-        rfid_hash = hash_rfid(rfid_hex)
+        if not whitelist:
+            # Ohne übergebene Whitelist IST die Tag-Verwaltung die einzige
+            # Quelle — und die hat oben schon nichts gefunden. Nicht behaupten,
+            # es sei keine Whitelist konfiguriert: der Aufrufer (OCPP) fragt
+            # absichtlich mit leerer Liste, und die Meldung würde bei der
+            # Fehlersuche in die falsche Richtung schicken.
+            self._logger.warning("RFID nicht autorisiert: %s... — Karte ist nicht "
+                                 "freigeschaltet (weder in der Tag-Verwaltung noch "
+                                 "in rfid_whitelist)", rfid_hash[:16])
+            return False
 
         # Whitelist enthält Hex-Strings, wir vergleichen Hashes
         for whitelisted_rfid in whitelist:
@@ -546,12 +626,26 @@ class SessionManager:
         result = {
             "transmitted": 0,
             "failed": 0,
+            "private": 0,
             "errors": []
         }
 
         for row in rows:
             session_id = row[0]
             login = row[6] if len(row) > 6 else None
+
+            # ABRECHNUNGSSCHRANKE: Eine als privat eingeordnete Karte darf
+            # Dolibarr nie erreichen. Geprüft wird die AKTUELLE Einordnung,
+            # damit ein nachträgliches Umstellen auf privat eine noch nicht
+            # übertragene Ladung auch noch stoppt.
+            tag = self._get_tag_by_hash(row[1])
+            if tag is not None and tag['mode'] == TAG_MODE_PRIVATE:
+                cursor.execute("UPDATE sessions SET status = 'private' WHERE id = ?",
+                               (session_id,))
+                result["private"] += 1
+                self._logger.info("Session %s ist privat — bleibt lokal, keine Übertragung",
+                                  session_id)
+                continue
             session_data = {
                 "wallbox_id": row[2],
                 "start_time": format_iso8601(row[3]),
@@ -589,3 +683,407 @@ class SessionManager:
                          result["transmitted"], result["failed"])
 
         return result
+
+    # ------------------------------------------------------------------
+    # Nachbearbeitung aus der Verwaltungsoberfläche
+    # ------------------------------------------------------------------
+
+    def list_sessions(self, month: Optional[str] = None, status: Optional[str] = None,
+                      limit: int = 1000) -> list:
+        """Sessions, neueste zuerst. month 'YYYY-MM'; status wie in der DB oder
+        'pending' (abgeschlossen, noch nicht übertragen) / 'transmitted'."""
+        where, args = [], []
+        if month:
+            where.append("strftime('%Y-%m', start_time) = ?")
+            args.append(month)
+        if status == 'pending':
+            where.append("status = 'completed' AND transmitted_at IS NULL")
+        elif status == 'transmitted':
+            where.append("status = 'completed' AND transmitted_at IS NOT NULL")
+        elif status:
+            where.append("status = ?")
+            args.append(status)
+        sql = ("SELECT * FROM sessions" + (" WHERE " + " AND ".join(where) if where else "") +
+               " ORDER BY start_time DESC, id DESC LIMIT ?")
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(sql, (*args, limit)).fetchall()]
+        finally:
+            conn.close()
+
+    def session_counts(self) -> Dict[str, int]:
+        """Anzahl je Status, dazu 'pending' (abgeschlossen, noch nicht übertragen)."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            counts = dict(conn.execute("SELECT status, COUNT(*) FROM sessions GROUP BY status").fetchall())
+            counts['pending'] = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE status = 'completed' AND transmitted_at IS NULL"
+            ).fetchone()[0]
+            return counts
+        finally:
+            conn.close()
+
+    def resolve_incomplete_session(self, session_id: int, total_kwh: float) -> bool:
+        """Unvollständige Session mit von Hand ermittelter Energiemenge abschließen —
+        danach wird sie wie jede andere übertragen."""
+        if not 0 < total_kwh < 1000:
+            raise ValueError("kWh: mehr als 0 und unter 1000")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute('''
+                UPDATE sessions SET total_kwh = ?, status = 'completed',
+                       end_time = COALESCE(end_time, start_time),
+                       stop_reason = TRIM(COALESCE(stop_reason, '') || ' manuell_korrigiert')
+                WHERE id = ? AND status = 'incomplete' AND transmitted_at IS NULL
+            ''', (round(total_kwh, 3), session_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def discard_session(self, session_id: int) -> bool:
+        """Noch nicht übertragene Session verwerfen — sie erreicht Dolibarr nie."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute('''
+                UPDATE sessions SET status = 'discarded',
+                       stop_reason = TRIM(COALESCE(stop_reason, '') || ' manuell_verworfen')
+                WHERE id = ? AND status IN ('incomplete', 'completed') AND transmitted_at IS NULL
+            ''', (session_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # OCPP-Transaktionen (session_source: ocpp)
+    #
+    # Unterschiede zum HA-Sensor-Pfad:
+    #   - Mehrere Sessions gleichzeitig aktiv (je Wallbox/Connector eine).
+    #   - Die OCPP-transactionId IST die sessions.id (AUTOINCREMENT → eindeutig
+    #     über Neustarts hinweg). Zugriffe prüfen zusätzlich charge_point_id,
+    #     damit eine alte, gepufferte Nachricht nie eine fremde Session trifft.
+    #   - Zeitstempel und Zählerstände kommen von der Wallbox.
+    # ------------------------------------------------------------------
+
+    def start_ocpp_transaction(self, rfid_hex: str, wallbox_id: str, charge_point_id: str,
+                               connector_id: int, meter_start_kwh: float, start_time: str,
+                               ocpp_start_timestamp: str) -> int:
+        """Legt eine aktive OCPP-Session an und gibt ihre ID (= transactionId) zurück.
+
+        Idempotent: Wiederholt die Wallbox dieselbe StartTransaction (gleiche
+        Wallbox, gleicher Connector, gleicher Original-Zeitstempel), kommt die
+        bereits vergebene ID zurück. Läuft auf dem Connector noch eine ältere
+        aktive Session, hat die Wallbox deren Stop verloren → 'incomplete'.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            # Ein echter Wiederholungsversuch trägt denselben Zeitstempel UND
+            # denselben Startzählerstand und kommt zeitnah. Eine Wallbox mit nie
+            # gestellter Uhr meldet dagegen für JEDE Ladung denselben Zeitstempel —
+            # ohne diese beiden Zusatzbedingungen bekäme jede weitere Ladung die ID
+            # der ersten und wäre nirgends erfasst.
+            cur.execute('''
+                SELECT id FROM sessions
+                WHERE charge_point_id = ? AND connector_id = ? AND ocpp_start_timestamp = ?
+                  AND start_energy_kwh = ?
+                  AND created_at >= ?
+                ORDER BY id DESC
+                LIMIT 1
+            ''', (charge_point_id, connector_id, ocpp_start_timestamp, meter_start_kwh,
+                  (datetime.now() - timedelta(days=1)).replace(microsecond=0).isoformat()))
+            existing = cur.fetchone()
+            if existing:
+                self._logger.info("StartTransaction wiederholt (%s/%s) — bestehende Session #%s",
+                                  charge_point_id, connector_id, existing['id'])
+                return int(existing['id'])
+
+            cur.execute('''
+                UPDATE sessions SET status = 'incomplete', stop_reason = 'ocpp_superseded', end_time = ?
+                WHERE status = 'active' AND charge_point_id = ? AND connector_id = ?
+            ''', (start_time, charge_point_id, connector_id))
+            if cur.rowcount:
+                self._logger.warning("%s/%s: %d ältere aktive Session(s) ohne Stop → incomplete",
+                                     charge_point_id, connector_id, cur.rowcount)
+
+            created_at = datetime.now().replace(microsecond=0).isoformat()
+            cur.execute('''
+                INSERT INTO sessions (rfid_hash, wallbox_id, start_time, start_energy_kwh, status,
+                                      created_at, start_energy_valid, charge_point_id, connector_id,
+                                      ocpp_start_timestamp)
+                VALUES (?, ?, ?, ?, 'active', ?, 1, ?, ?, ?)
+            ''', (hash_rfid(rfid_hex), wallbox_id, start_time, meter_start_kwh, created_at,
+                  charge_point_id, connector_id, ocpp_start_timestamp))
+            conn.commit()
+            session_id = int(cur.lastrowid)
+        finally:
+            conn.close()
+        self._logger.info("OCPP-Session gestartet: #%s (%s/%s, Zähler %.3f kWh)",
+                          session_id, charge_point_id, connector_id, meter_start_kwh)
+        return session_id
+
+    def update_ocpp_meter(self, transaction_id: int, charge_point_id: str, meter_kwh: float) -> bool:
+        """Merkt den letzten Zählerstand einer aktiven OCPP-Session (Fallback fürs Ende).
+
+        Nur monoton steigende Werte >= Startzählerstand werden übernommen.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE sessions SET last_meter_kwh = ?
+                WHERE id = ? AND charge_point_id = ? AND status = 'active'
+                  AND ? >= start_energy_kwh
+                  AND (last_meter_kwh IS NULL OR ? >= last_meter_kwh)
+            ''', (meter_kwh, transaction_id, charge_point_id, meter_kwh, meter_kwh))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def stop_ocpp_transaction(self, transaction_id: int, charge_point_id: str,
+                              meter_stop_kwh: Optional[float], end_time: str, reason: str,
+                              min_kwh: float = 0.05) -> Optional[Dict[str, Any]]:
+        """Schließt eine OCPP-Session ab. Gibt das Session-Dict NUR bei 'completed' zurück.
+
+        - Unbekannte ID / fremde Wallbox → None (Aufrufer bestätigt trotzdem).
+        - Bereits abgeschlossen (wiederholte StopTransaction) → None, keine Änderung.
+        - meterStop fehlt, ist 0 oder kleiner als der Start → letzter MeterValue.
+        - Kein brauchbarer Endstand oder unplausible Leistung → 'incomplete'.
+        - < min_kwh → 'discarded'.
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM sessions WHERE id = ? AND charge_point_id = ?",
+                        (transaction_id, charge_point_id))
+            row = cur.fetchone()
+            if row is None:
+                self._logger.warning("StopTransaction für unbekannte Transaktion %s (%s) — ignoriert",
+                                     transaction_id, charge_point_id)
+                return None
+            if row['status'] != 'active':
+                self._logger.info("StopTransaction für bereits abgeschlossene Session #%s — ignoriert",
+                                  transaction_id)
+                return None
+
+            start_kwh = float(row['start_energy_kwh'])
+            end_kwh = meter_stop_kwh
+            if end_kwh is None or end_kwh < start_kwh:
+                last = row['last_meter_kwh']
+                end_kwh = float(last) if last is not None and float(last) >= start_kwh else None
+            status, total_kwh = _classify_ocpp_energy(
+                start_kwh, end_kwh, row['start_time'], end_time, min_kwh,
+                max_plausible_kw=self.max_plausible_kw,
+                max_discard_hours=self.max_discard_hours)
+            cur.execute('''
+                UPDATE sessions
+                SET end_time = ?, end_energy_kwh = ?, total_kwh = ?, status = ?, stop_reason = ?,
+                    transmitted_at = CASE WHEN ? = 'discarded' THEN ? ELSE transmitted_at END
+                WHERE id = ?
+            ''', (end_time, end_kwh, total_kwh, status, reason, status, end_time, transaction_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        if status != 'completed':
+            self._logger.warning("OCPP-Session #%s: %s (Ende %s kWh, Grund %s)",
+                                 transaction_id, status, end_kwh, reason)
+            return None
+        self._logger.info("OCPP-Session #%s beendet: %.3f kWh (%s)", transaction_id, total_kwh, reason)
+        return {
+            'id': int(row['id']),
+            'rfid_hash': row['rfid_hash'],
+            'wallbox_id': row['wallbox_id'],
+            'start_time': row['start_time'],
+            'end_time': end_time,
+            'start_energy_kwh': start_kwh,
+            'end_energy_kwh': end_kwh,
+            'total_kwh': total_kwh,
+        }
+
+    def get_active_ocpp_sessions(self) -> list:
+        """Alle aktiven OCPP-Sessions (älteste zuerst)."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT * FROM sessions
+                WHERE status = 'active' AND charge_point_id IS NOT NULL
+                ORDER BY start_time ASC
+            ''')
+            return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Tag-Verwaltung des Addons
+    #
+    # Zweck: Karten in der Oberfläche benennen und einordnen, ohne die
+    # Konfiguration anzufassen — und entscheiden, ob eine Ladung abgerechnet
+    # (business) oder nur lokal protokolliert wird (private).
+    #
+    # Gespeichert wird ausschließlich der SHA-256-Hash. Der RFID-Klartext
+    # erscheint nur flüchtig im Lernmodus der Oberfläche, nie in der Datenbank.
+    #
+    # Abgrenzung zu Dolibarr: dort steht, WER der Mitarbeiter ist
+    # (llx_wallbox_rfid). Hier steht, OB überhaupt übertragen wird.
+    # ------------------------------------------------------------------
+
+    def _get_tag_by_hash(self, rfid_hash: str) -> Optional[Dict[str, Any]]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM tags WHERE rfid_hash = ?", (rfid_hash,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_tag(self, rfid_hex: str) -> Optional[Dict[str, Any]]:
+        """Tag-Eintrag zu einer Karte (Klartext-ID) oder None."""
+        return self._get_tag_by_hash(hash_rfid(rfid_hex))
+
+    def upsert_tag(self, rfid_hex: str, label: Optional[str] = None,
+                   mode: str = TAG_MODE_UNKNOWN) -> Dict[str, Any]:
+        """Legt einen Tag an oder aktualisiert Name und Einordnung.
+
+        Ein bestehender Eintrag behält first_seen und seen_count; nur Name,
+        Einordnung und last_seen werden überschrieben.
+        """
+        if mode not in VALID_TAG_MODES:
+            raise ValueError(f"mode muss {VALID_TAG_MODES} sein, war {mode!r}")
+        rfid_hash = hash_rfid(rfid_hex)
+        now = datetime.now().replace(microsecond=0).isoformat()
+        clean_label = (label or '').strip() or None
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute('''
+                INSERT INTO tags (rfid_hash, label, mode, first_seen, last_seen, seen_count)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(rfid_hash) DO UPDATE SET
+                    label = excluded.label,
+                    mode = excluded.mode,
+                    last_seen = excluded.last_seen
+            ''', (rfid_hash, clean_label, mode, now, now))
+            conn.commit()
+        finally:
+            conn.close()
+        self._logger.info("Tag %s... gespeichert: %s (%s)", rfid_hash[:16], clean_label, mode)
+        return self._get_tag_by_hash(rfid_hash)
+
+    def note_tag_seen(self, rfid_hex: str) -> Dict[str, Any]:
+        """Hält fest, dass eine Karte vorgehalten wurde — für den Lernmodus.
+
+        Eine unbekannte Karte landet als 'unknown' in der Liste (darf damit
+        NICHT laden) und wartet darauf, benannt und eingeordnet zu werden.
+        Eine bekannte Karte behält Name und Einordnung.
+        """
+        rfid_hash = hash_rfid(rfid_hex)
+        now = datetime.now().replace(microsecond=0).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute('''
+                INSERT INTO tags (rfid_hash, label, mode, first_seen, last_seen, seen_count)
+                VALUES (?, NULL, ?, ?, ?, 1)
+                ON CONFLICT(rfid_hash) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    seen_count = tags.seen_count + 1
+            ''', (rfid_hash, TAG_MODE_UNKNOWN, now, now))
+            conn.commit()
+        finally:
+            conn.close()
+        return self._get_tag_by_hash(rfid_hash)
+
+    def list_tags(self) -> list:
+        """Alle bekannten Tags: noch nicht eingeordnete zuerst, dann nach Name."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute('''
+                SELECT * FROM tags
+                ORDER BY CASE mode WHEN 'unknown' THEN 0 ELSE 1 END,
+                         label IS NULL, label, last_seen DESC
+            ''').fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def delete_tag(self, rfid_hex: str) -> bool:
+        """Entfernt einen Tag. True, wenn es ihn gab.
+
+        Danach darf die Karte nur noch laden, wenn sie in der
+        Konfigurations-Whitelist steht.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute("DELETE FROM tags WHERE rfid_hash = ?", (hash_rfid(rfid_hex),))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def delete_tag_by_hash(self, rfid_hash: str) -> bool:
+        """Entfernt einen Tag anhand seines Hashes.
+
+        Die Oberfläche kennt den RFID-Klartext bewusst nicht mehr, sobald eine
+        Karte eingetragen ist — zum Löschen genügt daher der Hash.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute("DELETE FROM tags WHERE rfid_hash = ?", (rfid_hash,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def update_tag_by_hash(self, rfid_hash: str, label: Optional[str], mode: str) -> bool:
+        """Name und Einordnung einer eingetragenen Karte ändern (ohne Klartext). True, wenn es sie gab."""
+        if mode not in VALID_TAG_MODES:
+            raise ValueError(f"mode muss {VALID_TAG_MODES} sein, war {mode!r}")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute("UPDATE tags SET label = ?, mode = ? WHERE rfid_hash = ?",
+                               ((label or '').strip() or None, mode, rfid_hash))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def is_tag_billable(self, rfid_hash: str) -> bool:
+        """Darf eine Ladung mit diesem Hash abgerechnet werden?
+
+        Ohne Eintrag: ja — bestehende Installationen pflegen nur die
+        Konfigurations-Whitelist und müssen weiter abrechnen.
+        """
+        tag = self._get_tag_by_hash(rfid_hash)
+        return tag is None or tag['mode'] != TAG_MODE_PRIVATE
+
+def _classify_ocpp_energy(start_kwh: float, end_kwh: Optional[float], start_time: str,
+                          end_time: str, min_kwh: float,
+                          max_plausible_kw: float = _MAX_PLAUSIBLE_KW,
+                          max_discard_hours: float = _MAX_DISCARD_HOURS):
+    """(status, total_kwh) für eine abgeschlossene OCPP-Session."""
+    if end_kwh is None:
+        return 'incomplete', None
+    total_kwh = round(end_kwh - start_kwh, 3)
+    try:
+        hours = (datetime.fromisoformat(end_time) - datetime.fromisoformat(start_time)).total_seconds() / 3600.0
+    except (TypeError, ValueError):
+        hours = None
+    if total_kwh < min_kwh:
+        # 'discarded' meint: Karte kurz gehalten, nie wirklich geladen. Zog sich die
+        # Session dagegen über Stunden, ist fast nichts gezählt worden — typisch für
+        # eine Wallbox, die ihren Zähler in kWh statt in Wh meldet (Faktor 1000 zu
+        # klein). Das darf nicht still verworfen werden.
+        if hours is not None and hours >= max_discard_hours:
+            return 'incomplete', total_kwh
+        return 'discarded', max(0.0, total_kwh)
+    if hours is not None and total_kwh > max_plausible_kw * max(hours, 0.0) + 1.0:
+        return 'incomplete', total_kwh
+    return 'completed', total_kwh
